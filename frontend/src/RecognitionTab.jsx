@@ -6,12 +6,15 @@ import { UserCheck, UserX } from 'lucide-react';
 import CameraFeed from './CameraFeed';
 import RecentActivity from './RecentActivity';
 
+const RECOGNITION_COOLDOWN = 10 * 60 * 1000; // 10 minutes in milliseconds
+
 const RecognitionTab = () => {
   const [recognizedPerson, setRecognizedPerson] = useState(null);
   const [status, setStatus] = useState({ type: '', message: '' });
   const [processing, setProcessing] = useState(false);
   const recognitionTimeoutRef = useRef(null);
   const lastRecognitionTime = useRef(0);
+  const recognizedUsers = useRef(new Map()); // Track last recognition time for each user
 
   const handleFaceDetected = useCallback(async (imageDataUrl) => {
     const now = Date.now();
@@ -42,17 +45,32 @@ const RecognitionTab = () => {
       }
 
       if (data.success) {
-        setRecognizedPerson(data);
-        setStatus({
-          type: 'success',
-          message: `Welcome, ${data.name}!${data.message ? ` ${data.message}` : ''}`
-        });
+        const userId = data.id; // Ensure backend returns user ID
+        const lastRecognition = recognizedUsers.current.get(userId) || 0;
+        
+        if (now - lastRecognition >= RECOGNITION_COOLDOWN) {
+          // Update last recognition time
+          recognizedUsers.current.set(userId, now);
+          
+          setRecognizedPerson(data);
+          setStatus({
+            type: 'success',
+            message: `Welcome, ${data.name}!${data.message ? ` ${data.message}` : ''}`
+          });
 
-        // Reset after 5 seconds
-        recognitionTimeoutRef.current = setTimeout(() => {
-          setRecognizedPerson(null);
-          setStatus({ type: '', message: '' });
-        }, 5000);
+          // Reset after 5 seconds
+          recognitionTimeoutRef.current = setTimeout(() => {
+            setRecognizedPerson(null);
+            setStatus({ type: '', message: '' });
+          }, 5000);
+        } else {
+          // User recognized but within cooldown period
+          const minutesRemaining = Math.ceil((RECOGNITION_COOLDOWN - (now - lastRecognition)) / 60000);
+          setStatus({
+            type: 'info',
+            message: `Already logged. Please try again in ${minutesRemaining} minutes.`
+          });
+        }
       } else {
         setStatus({
           type: 'error',
@@ -68,7 +86,7 @@ const RecognitionTab = () => {
     } finally {
       setProcessing(false);
     }
-  }, []);
+  }, [processing]);
 
   return (
     <Card>

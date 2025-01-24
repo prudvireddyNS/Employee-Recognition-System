@@ -1,66 +1,73 @@
-import os
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Boolean, Float, PickleType, Index, event
-from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from typing import List, Optional
+from .models import Employee, Activity, ActivityResponse
 from datetime import datetime
+import pytz
 
-Base = declarative_base()
+IST = pytz.timezone('Asia/Kolkata')
 
-class Employee(Base):
-    __tablename__ = 'employees'
-    id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False)
-    department = Column(String, nullable=False)
-    position = Column(String, nullable=False)  # Added position column
-    email = Column(String, unique=True)
-    company_email = Column(String, unique=True)  # Added company_email column
-    face_encoding = Column(PickleType, nullable=True)  # Add this line to store face encoding
-    created_at = Column(DateTime, default=datetime.utcnow)
-    attendances = relationship("Attendance", back_populates="employee")
+class Database:
+    def __init__(self):
+        self.employees: List[Employee] = []
+        self.activities: List[Activity] = []
 
-class Attendance(Base):
-    __tablename__ = 'attendance'
-    id = Column(Integer, primary_key=True)
-    employee_id = Column(Integer, ForeignKey('employees.id'))
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    processed = Column(Boolean, default=False)  # To prevent duplicate processing
-    confidence = Column(Float)  # Store recognition confidence
-    employee = relationship("Employee", back_populates="attendances")
+    def add_employee(self, employee: Employee):
+        self.employees.append(employee)
 
-class AdminUser(Base):
-    __tablename__ = 'admin_users'
-    id = Column(Integer, primary_key=True)
-    username = Column(String, unique=True, nullable=False)
-    password_hash = Column(String, nullable=False)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    last_login = Column(DateTime, nullable=True)
+    def get_all_employees(self) -> List[Employee]:
+        return self.employees
 
-class APIKey(Base):
-    __tablename__ = 'api_keys'
-    id = Column(Integer, primary_key=True)
-    key = Column(String, unique=True, nullable=False)
-    name = Column(String, nullable=False)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime, nullable=True)
-    last_used = Column(DateTime, nullable=True)
+    def add_activity(self, activity: Activity):
+        # Ensure timestamp has timezone info
+        if activity.timestamp.tzinfo is None:
+            activity.timestamp = IST.localize(activity.timestamp)
+        self.activities.append(activity)
 
-# Update indexes (remove API key index)
-Index('idx_employee_department', Employee.department)
-Index('idx_attendance_timestamp', Attendance.timestamp)
-Index('idx_attendance_employee', Attendance.employee_id)
-Index('idx_admin_username', AdminUser.username)
-Index('idx_api_key', APIKey.key)
+    def get_last_activity(self, employee_id: str) -> Optional[Activity]:
+        try:
+            employee_activities = [
+                a for a in self.activities 
+                if a.employee_id == employee_id
+            ]
+            if not employee_activities:
+                return None
+                
+            # Convert all timestamps to IST for comparison
+            return max(
+                employee_activities,
+                key=lambda x: x.timestamp.astimezone(IST)
+            )
+        except Exception as e:
+            print(f"Error in get_last_activity: {e}")
+            return None
 
-# Create engine and session
-engine = create_engine('sqlite:///attendance.db')
-SessionLocal = sessionmaker(bind=engine)
-
-# Optimize SQLite for better concurrent performance
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA synchronous=NORMAL")
-    cursor.execute("PRAGMA temp_store=MEMORY")
-    cursor.close()
+    def get_recent_activities(self, limit: int = 10) -> List[ActivityResponse]:
+        try:
+            # Get current time in IST
+            now = datetime.now(IST)
+            
+            # Sort activities by timestamp in descending order
+            recent = sorted(
+                [a for a in self.activities if a.timestamp], 
+                key=lambda x: x.timestamp.astimezone(IST),
+                reverse=True
+            )[:limit]
+            
+            responses = []
+            for activity in recent:
+                employee = next(
+                    (e for e in self.employees if e.id == activity.employee_id), 
+                    None
+                )
+                if employee:
+                    ist_time = activity.timestamp.astimezone(IST)
+                    responses.append(ActivityResponse(
+                        id=f"{activity.id}-{ist_time.timestamp()}",  # Unique ID including timestamp
+                        name=f"{employee.first_name} {employee.last_name}",
+                        department=employee.department,
+                        lastAttendance=ist_time.isoformat()
+                    ))
+            
+            return responses
+        except Exception as e:
+            print(f"Error in get_recent_activities: {e}")
+            return []

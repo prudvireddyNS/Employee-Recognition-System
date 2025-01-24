@@ -9,15 +9,6 @@ import { Loader2 } from 'lucide-react';
 
 const RegistrationForm = ({ formData, handleChange, handleRegister, capturedImage, loading, message }) => {
   const isFormValid = () => {
-    console.log('Form validation:', {
-      firstName: Boolean(formData.firstName?.trim()),
-      lastName: Boolean(formData.lastName?.trim()),
-      department: Boolean(formData.department),
-      position: Boolean(formData.position?.trim()),
-      email: Boolean(formData.email?.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)),
-      image: Boolean(capturedImage)
-    });
-
     return (
       formData.firstName?.trim() && 
       formData.lastName?.trim() && 
@@ -117,19 +108,6 @@ const RegistrationForm = ({ formData, handleChange, handleRegister, capturedImag
           'Register Employee'
         )}
       </Button>
-
-      {/* Debug info - remove in production */}
-      <div className="text-sm text-gray-500">
-        <p>Form Status:</p>
-        <ul>
-          <li>First Name: {formData.firstName ? '✓' : '×'}</li>
-          <li>Last Name: {formData.lastName ? '✓' : '×'}</li>
-          <li>Department: {formData.department ? '✓' : '×'}</li>
-          <li>Position: {formData.position ? '✓' : '×'}</li>
-          <li>Email: {formData.email?.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/) ? '✓' : '×'}</li>
-          <li>Image Captured: {capturedImage ? '✓' : '×'}</li>
-        </ul>
-      </div>
 
       {message && (
         <Alert variant={message.toLowerCase().includes("error") || message.toLowerCase().includes("failed") ? "destructive" : "default"}>

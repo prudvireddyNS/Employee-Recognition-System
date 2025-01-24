@@ -1,420 +1,265 @@
-import os
-from pathlib import Path
-from fastapi import FastAPI, HTTPException, Depends, status, Request, APIRouter
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
-from typing import List
-from datetime import datetime, timedelta
-from .database import SessionLocal, Employee, Attendance  # Import models directly from database
-from . import schemas, face_recognition
-from . import admin, database
-from .middleware import log_request_middleware, JWTBearer
-from .auth import get_current_user
-from .config import get_settings
-import redis
-from fastapi_cache import FastAPICache
-from fastapi_cache.backends.redis import RedisBackend
-from fastapi_cache.decorator import cache
-from prometheus_fastapi_instrumentator import Instrumentator
-import sentry_sdk
-import logging
-from prometheus_client import Counter, Histogram
-import time
-from fastapi.openapi.utils import get_openapi
-from fastapi.security import OAuth2PasswordBearer, SecurityScopes
-from contextlib import asynccontextmanager
+from pydantic import BaseModel
+from facenet_pytorch import MTCNN, InceptionResnetV1
+import torch
+import numpy as np
+from typing import List, Optional
+import base64
+import io
+from PIL import Image
+from datetime import datetime, timedelta, timezone
+import pytz
+import uuid
+from .models import Employee, Activity
+from .database import Database
 
-# Configure logger
-logging.basicConfig(
-    filename='app.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+app = FastAPI()
 
-# Initialize Sentry for error tracking only if DSN is provided
-SENTRY_DSN = os.getenv("SENTRY_DSN")
-if SENTRY_DSN:
-    try:
-        sentry_sdk.init(
-            dsn=SENTRY_DSN,
-            traces_sample_rate=1.0,
-            environment=os.getenv("ENVIRONMENT", "development"),
-            enable_tracing=True
-        )
-        logger.info("Sentry initialized successfully")
-    except Exception as e:
-        logger.warning(f"Failed to initialize Sentry: {e}")
-else:
-    logger.info("Sentry DSN not provided, skipping initialization")
-
-# Define tags metadata
-tags_metadata = [
-    {
-        "name": "default",
-        "description": "Default operations for face recognition and attendance"
-    },
-    {
-        "name": "admin",
-        "description": "Administrative operations requiring authentication"
-    }
-]
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    redis_client = redis.from_url(settings.REDIS_URL, encoding="utf8")
-    FastAPICache.init(RedisBackend(redis_client), prefix="fastapi-cache")
-    yield
-    # Shutdown
-    await FastAPICache.clear()
-
-app = FastAPI(
-    title="Employee Recognition System",
-    description="API for employee registration and face recognition",
-    version="1.0.0",
-    docs_url="/api/v1/docs",  # Update Swagger UI path
-    redoc_url="/api/v1/redoc",  # Update ReDoc path
-    openapi_tags=tags_metadata,
-    lifespan=lifespan
-)
-
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    
-    openapi_schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
-    
-    # Add security schemes
-    openapi_schema["components"]["securitySchemes"] = {
-        "OAuth2PasswordBearer": {
-            "type": "oauth2",
-            "flows": {
-                "password": {
-                    "tokenUrl": "api/v1/admin/login",
-                    "scopes": {}
-                }
-            }
-        },
-        "Bearer": {
-            "type": "http",
-            "scheme": "bearer",
-            "bearerFormat": "JWT"
-        }
-    }
-    
-    # Add global security
-    openapi_schema["security"] = [
-        {"OAuth2PasswordBearer": []},
-        {"Bearer": []}
-    ]
-    
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-app.openapi = custom_openapi
-
-settings = get_settings()
-
-# Add middleware
-app.middleware("http")(log_request_middleware)
-
+# CORS middleware configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=["http://localhost:5174"],  # Replace with your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize monitoring
-Instrumentator().instrument(app).expose(app)
-
-# Enhanced metrics
-REQUEST_COUNT = Counter(
-    'http_requests_total',
-    'Total HTTP requests',
-    ['method', 'endpoint', 'status']
+# Initialize face detection and recognition models
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+mtcnn = MTCNN(
+    image_size=160, margin=0,
+    min_face_size=20,
+    thresholds=[0.6, 0.7, 0.7],
+    factor=0.709,
+    post_process=True,
+    device=device
 )
-REQUEST_LATENCY = Histogram(
-    'http_request_duration_seconds',
-    'HTTP request latency',
-    ['method', 'endpoint']
-)
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-# API versioning
-api_v1 = APIRouter(prefix="/api/v1")
+# Initialize database
+db = Database()
 
-@app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    
-    REQUEST_COUNT.labels(
-        method=request.method,
-        endpoint=request.url.path,
-        status=response.status_code
-    ).inc()
-    
-    REQUEST_LATENCY.labels(
-        method=request.method,
-        endpoint=request.url.path
-    ).observe(time.time() - start_time)
-    
-    return response
+# Add IST timezone
+IST = pytz.timezone('Asia/Kolkata')
 
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    }
-# Error handler
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    # Log the error
-    logger.error(f"Global error: {exc}", exc_info=True)
-    # Capture in Sentry
-    sentry_sdk.capture_exception(exc)
-    return JSONResponse(
-        status_code=500,
-        content={"message": "Internal server error"}
-    )
+# Adjust threshold for face recognition
+FACE_RECOGNITION_THRESHOLD = 0.6  # Decrease this value for stricter matching
 
-# Remove these lines that use the old router
-# admin_router = APIRouter(prefix="/admin", tags=["Admin"])
-# for route in admin.router.routes:
-#     if not route.path.endswith("/login"):
-#         admin_router.routes.append(route)
-# api_v1.include_router(admin.router, prefix="/admin", tags=["Admin"], include_in_schema=False)
-# api_v1.include_router(admin_router)
+def get_current_time():
+    return datetime.now(IST)
 
-# Replace with direct inclusion of the new public and protected routers
-api_v1.include_router(admin.router_public)  # Include public admin routes (like login)
-api_v1.include_router(admin.router_protected)  # Include protected admin routes
+class RegisterEmployee(BaseModel):
+    image: str
+    firstName: str
+    lastName: str
+    department: str
+    position: str
+    email: str
 
-def get_db():
-    db = SessionLocal()
+class FaceDetectionRequest(BaseModel):
+    image: str
+
+def decode_base64_image(base64_string: str):
     try:
-        yield db
-    finally:
-        db.close()
+        # Remove header if present
+        if 'base64,' in base64_string:
+            base64_string = base64_string.split('base64,')[1]
+        
+        # Decode base64 string to bytes
+        image_bytes = base64.b64decode(base64_string)
+        
+        # Convert to PIL Image
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        return np.array(image)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image format: {str(e)}")
 
-# Public endpoints
-@api_v1.post("/recognize-face", response_model=schemas.FaceRecognitionResponse)
-async def recognize_face_endpoint(image_data: schemas.ImageData, db: Session = Depends(get_db)):
+def detect_faces_mtcnn(image):
+    # Convert numpy array to PIL Image if needed
+    if isinstance(image, np.ndarray):
+        image = Image.fromarray(image)
+    
+    # Detect faces
+    boxes, _ = mtcnn.detect(image)
+    
+    if boxes is None:
+        return []
+    
+    # Convert boxes to expected format
+    faces = []
+    for box in boxes:
+        left, top, right, bottom = [int(coord) for coord in box]
+        faces.append({
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+            "left": left
+        })
+    
+    return faces
+
+def get_face_embedding(image):
+    # Convert numpy array to PIL Image if needed
+    if isinstance(image, np.ndarray):
+        image = Image.fromarray(image)
+    
+    # Get face embedding
     try:
-        # Extract face from image
-        face_data = face_recognition.face_system.extract_face(image_data.image)
-        if not face_data["success"]:
-            return schemas.FaceRecognitionResponse(
-                success=False,
-                message=face_data["message"]
+        # Detect and align face
+        face = mtcnn(image)
+        if face is None:
+            return None
+        
+        # Convert face to batch form
+        face = face.unsqueeze(0).to(device)
+        
+        # Get embedding
+        embedding = resnet(face)
+        
+        return embedding.detach().cpu().numpy()[0]
+    except Exception as e:
+        print(f"Error getting face embedding: {e}")
+        return None
+
+@app.post("/detect-faces")
+async def detect_faces(request: FaceDetectionRequest):
+    try:
+        # Decode the base64 image
+        image = decode_base64_image(request.image)
+        
+        # Detect faces using MTCNN
+        faces = detect_faces_mtcnn(image)
+        
+        return {"success": True, "faces": faces}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/register-employee")
+async def register_employee(employee_data: RegisterEmployee):
+    try:
+        # Decode and process the image
+        image = decode_base64_image(employee_data.image)
+        
+        # Get face embedding
+        face_embedding = get_face_embedding(image)
+        if face_embedding is None:
+            raise HTTPException(status_code=400, detail="No face detected in the image")
+        
+        # Generate company email
+        company_email = f"{employee_data.firstName.lower()}.{employee_data.lastName.lower()}@company.com"
+        
+        # Create employee record
+        employee = Employee(
+            id=str(uuid.uuid4()),
+            first_name=employee_data.firstName,
+            last_name=employee_data.lastName,
+            department=employee_data.department,
+            position=employee_data.position,
+            email=employee_data.email,
+            company_email=company_email,
+            face_embedding=face_embedding.tolist(),
+            created_at=datetime.utcnow()
+        )
+        
+        # Save to database
+        db.add_employee(employee)
+        
+        return {
+            "success": True,
+            "company_email": company_email
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/v1/recognize-face")
+async def recognize_face(request: FaceDetectionRequest):
+    try:
+        # Decode the image
+        image = decode_base64_image(request.image)
+        
+        # Get face embedding
+        face_embedding = get_face_embedding(image)
+        if face_embedding is None:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "message": "No face detected"}
             )
-
-        # Get all employees with face encodings
-        employees = db.query(database.Employee).filter(
-            database.Employee.face_encoding.isnot(None)
-        ).all()
-
-        # Check for matching employee
+        
+        # Get all employees
+        employees = db.get_all_employees()
+        
+        # Improved face matching logic
+        min_distance = float('inf')
+        matched_employee = None
+        face_embedding = face_embedding / np.linalg.norm(face_embedding)  # Normalize embedding
+        
         for employee in employees:
-            confidence = face_recognition.face_system.compare_faces_with_confidence(
-                employee.face_encoding, 
-                face_data["encoding"]
-            )
+            stored_embedding = np.array(employee.face_embedding)
+            stored_embedding = stored_embedding / np.linalg.norm(stored_embedding)  # Normalize stored embedding
+            distance = np.linalg.norm(face_embedding - stored_embedding)
             
-            if confidence > 0.6:  # Confidence threshold
-                # Check for recent attendance (within 5 minutes)
-                recent_attendance = db.query(database.Attendance).filter(
-                    database.Attendance.employee_id == employee.id,
-                    database.Attendance.timestamp >= datetime.now() - timedelta(minutes=5)
-                ).first()
-
-                if recent_attendance:
-                    return schemas.FaceRecognitionResponse(
-                        success=True,
-                        name=employee.name,
-                        message="Attendance already marked",
-                        timestamp=recent_attendance.timestamp
+            if distance < min_distance and distance < FACE_RECOGNITION_THRESHOLD:
+                min_distance = distance
+                matched_employee = employee
+        
+        if matched_employee:
+            current_time = get_current_time()
+            last_activity = db.get_last_activity(matched_employee.id)
+            
+            if last_activity:
+                last_time = last_activity.timestamp.astimezone(IST)
+                time_diff = current_time - last_time
+                if time_diff < timedelta(minutes=10):
+                    minutes_remaining = 10 - int(time_diff.total_seconds() / 60)
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "success": False,
+                            "message": f"Already logged at {last_time.strftime('%I:%M %p')}. Try after {minutes_remaining} minutes.",
+                            "cooldown": True
+                        }
                     )
 
-                # Create new attendance record
-                attendance = database.Attendance(
-                    employee_id=employee.id,
-                    timestamp=datetime.now(),
-                    confidence=confidence
-                )
-                db.add(attendance)
-                db.commit()
-
-                return schemas.FaceRecognitionResponse(
-                    success=True,
-                    name=employee.name,
-                    department=employee.department,
-                    timestamp=attendance.timestamp
-                )
-
-        return schemas.FaceRecognitionResponse(
-            success=False,
-            message="Face not recognized"
+            # Record new activity with IST timezone
+            activity = Activity(
+                id=str(uuid.uuid4()),
+                employee_id=matched_employee.id,
+                timestamp=current_time
+            )
+            db.add_activity(activity)
+            
+            return {
+                "success": True,
+                "id": matched_employee.id,
+                "name": f"{matched_employee.first_name} {matched_employee.last_name}",
+                "department": matched_employee.department,
+                "message": f"Attendance recorded at {current_time.strftime('%I:%M %p')}"
+            }
+        
+        return JSONResponse(
+            status_code=404,
+            content={"success": False, "message": "Face not recognized"}
         )
-
     except Exception as e:
-        print(f"Error recognizing face: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=400, detail=str(e))
 
-@api_v1.post("/detect-faces", response_model=schemas.FaceDetectionResponse)
-async def detect_faces(image_data: schemas.ImageData):
-    """Detect faces in an image and return their locations"""
+@app.get("/api/v1/recent-activity")
+async def get_recent_activity():
     try:
-        result = face_recognition.face_system.detect_faces(image_data.image)
-        return result
+        activities = db.get_recent_activities(limit=10)
+        # Activities are already in IST format from the database
+        return activities
     except Exception as e:
-        print(f"Error detecting faces: {e}")
+        print(f"Error in get_recent_activity: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@api_v1.get("/recent-activity")
-@cache(expire=60)
-async def get_recent_activity(db: Session = Depends(get_db)):
-    try:
-        current_time = datetime.now()
-        activities = (
-            db.query(database.Attendance)
-            .join(database.Employee)
-            .filter(
-                database.Attendance.timestamp >= current_time - timedelta(hours=24)
-            )
-            .order_by(database.Attendance.timestamp.desc())
-            .limit(10)
-            .all()
-        )
-
-        return [{
-            "id": activity.id,
-            "name": activity.employee.name,
-            "department": activity.employee.department,
-            "lastAttendance": activity.timestamp.strftime("%I:%M %p")
-        } for activity in activities]
-
-    except Exception as e:
-        print(f"Error fetching recent activity: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch recent activity"
-        )
-
-# Protected endpoints
-@api_v1.post("/register-employee", response_model=schemas.EmployeeResponse, dependencies=[Depends(JWTBearer())])
-async def register_employee(request: Request, data: schemas.RegistrationData, db: Session = Depends(get_db)):
-    try:
-        print("Starting employee registration process")
-        
-        # Validate input data
-        if not all([data.firstName, data.lastName, data.department, data.position, data.email, data.image]):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="All fields are required"
-            )
-            
-        # Extract and validate face
-        face_data = face_recognition.face_system.extract_face(data.image)
-        if not face_data["success"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=face_data["message"]
-            )
-
-        # Check if email already exists
-        existing_employee = db.query(database.Employee).filter(
-            database.Employee.email == data.email
-        ).first()
-        
-        if existing_employee:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Email already registered"
-            )
-
-        # Check if face already exists
-        existing_face = db.query(database.Employee).filter(
-            database.Employee.face_encoding.isnot(None)
-        ).all()
-        
-        for emp in existing_face:
-            if face_recognition.face_system.compare_faces(emp.face_encoding, face_data["encoding"]):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Face already registered"
-                )
-
-        # Create employee with face encoding
-        try:
-            employee = database.Employee(
-                name=f"{data.firstName} {data.lastName}",
-                department=data.department,
-                position=data.position,
-                email=data.email,
-                company_email=f"{data.firstName.lower()}.{data.lastName.lower()}@company.com",
-                face_encoding=face_data["encoding"],
-                created_at=datetime.utcnow()
-            )
-            
-            db.add(employee)
-            db.commit()
-            db.refresh(employee)
-            
-            return employee
-
-        except Exception as e:
-            db.rollback()
-            print(f"Database error during registration: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to register employee"
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Employee registration error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Registration failed: {str(e)}"
-        )
-
-# Include routers
-app.include_router(api_v1)
-app.include_router(
-    admin.router_public,
-    prefix="/api/v1"
-)
-app.include_router(
-    admin.router_protected,
-    prefix="/api/v1"
-)
-
-# Ensure the root path is defined
-@app.get("/")
-async def read_root():
-    return {"message": "Welcome to the Employee Recognition System API"}
-
-# Ensure the docs path is correctly set
-@app.get("/docs")
-async def get_docs():
-    return {"message": "Swagger UI is available at /api/v1/docs"}
-
-# Ensure the redoc path is correctly set
-@app.get("/redoc")
-async def get_redoc():
-    return {"message": "ReDoc is available at /api/v1/redoc"}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -4,7 +4,6 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Loader2, Camera, RefreshCw } from 'lucide-react';
-import useCamera from './hooks/useCamera';
 import RegistrationForm from './RegistrationForm';
 import EmployeeIdCard from './EmployeeIdCard';
 import CameraFeed from './CameraFeed';
@@ -125,14 +124,6 @@ const RegistrationTab = () => {
       [name]: value
     }));
     console.log('Form data updated:', name, value); // Debug log
-  };
-
-  const handleSelectChange = (value) => {
-    setFormData(prev => ({
-      ...prev,
-      department: value
-    }));
-    console.log('Department updated:', value); // Debug log
   };
 
   const handleReset = () => {
